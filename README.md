@@ -48,6 +48,20 @@ path fixed.
 - Write throttling to stop hammering the PN532 (previous builds polled every
   ~1 ms while reads waited 2 s).
 
+### Battery gauge & power-off fixes
+- **Fixed the "battery shows 100% then the device won't turn off" bug.** The
+  BQ27220 fuel gauge and the BQ25896 PMIC share the same I2C (`Wire`) bus. A
+  failed gauge read used to return garbage (clamped to **100%**) *and* could
+  wedge the bus, which silently broke `PPM.shutdown()` — the device could then
+  only be recovered with a hardware reset.
+- `i2cReadBytes` now validates the I2C transaction, zeroes the buffer and retries
+  (up to 3×); a failed read returns a sentinel (`0xFFFF`) instead of garbage.
+- `getBattery()` rejects the sentinel and impossible values (> 100) and keeps the
+  **last known-good percentage** instead of jumping to 100%.
+- `powerOff()` re-initialises the I2C bus before calling `PPM.shutdown()` and
+  falls back to a hardware deep-sleep "off" (drops the power-hold rail, wakes on
+  GPIO 6) if the PMIC does not answer — the device always powers off.
+
 ## Building
 
 ```sh

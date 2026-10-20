@@ -33,6 +33,9 @@ BQ27220 bq;
 #include "modules/rf/rf_utils.h"
 #include <Adafruit_PN532.h>
 
+void powerDownNFC();
+void powerDownCC1101();
+
 /***************************************************************************************
 ** Function name: _setup_gpio()
 ** Description:   initial setup for the device
@@ -116,9 +119,15 @@ void _setup_gpio() {
 ***************************************************************************************/
 #if defined(USE_BQ27220_VIA_I2C)
 int getBattery() {
-    int percent = 0;
-    percent = bq.getChargePcnt();
-    return (percent < 0) ? 1 : (percent >= 100) ? 100 : percent;
+    uint16_t raw = bq.getChargePcnt();
+    // 0xFFFF is the I2C-failure sentinel from the fuel gauge (or an obviously
+    // impossible value) - keep the last good reading instead of jumping to 100%.
+    static int lastGood = -1;
+    if (raw == 0xFFFF || raw > 100) {
+        return (lastGood >= 0) ? lastGood : 1;
+    }
+    lastGood = (int)raw;
+    return (lastGood < 1) ? 1 : lastGood;
 }
 #endif
 /*********************************************************************
@@ -206,7 +215,27 @@ void InputHandler(void) {
 
 void powerOff() {
 #ifdef T_EMBED_1101
+    // The BQ25896 PMIC and the BQ27220 gauge share the Wire bus. If a previous
+    // failed gauge read left the bus wedged, PPM.shutdown() silently does
+    // nothing and the device cannot be turned off. Re-initialise the bus and
+    // retry the PMIC before falling back to a deep-sleep "off" in hardware.
+    Wire.end();
+    delay(10);
+    Wire.begin(SYS_I2C_SDA, SYS_I2C_SCL);
+    delay(10);
+    PPM.init(Wire, SYS_I2C_SDA, SYS_I2C_SCL, BQ25896_SLAVE_ADDRESS);
+
     PPM.shutdown();
+    delay(200);
+
+    // Fallback: drop the power-hold rail and sleep. Cuts power on boards where
+    // the PMIC ACK never made it, instead of leaving the user with a frozen
+    // device that only a reset can recover.
+    powerDownNFC();
+    powerDownCC1101();
+    digitalWrite(PIN_POWER_ON, LOW);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_6, LOW);
+    esp_deep_sleep_start();
 #endif
 }
 

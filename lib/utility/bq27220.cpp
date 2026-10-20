@@ -122,7 +122,10 @@ uint16_t BQ27220::getDesignCap(void){ return readWord(BQ27220_COMMAND_DESIGN_CAP
 uint16_t BQ27220::readWord(uint16_t subAddress)
 {
     uint8_t data[2];
-    i2cReadBytes(subAddress, data, 2);
+    if (!i2cReadBytes(subAddress, data, 2))
+    {
+        return 0xFFFF; // sentinel: I2C read failed
+    }
     return ((uint16_t)data[1] << 8) | data[0];
 }
 
@@ -161,16 +164,38 @@ uint16_t BQ27220::writeCtrlWord(uint16_t fun)
 
 bool BQ27220::i2cReadBytes(uint8_t subAddress, uint8_t *dest, uint8_t count)
 {
-    wire->beginTransmission(addr);
-    wire->write(subAddress);
-    wire->endTransmission(true);
-
-    wire->requestFrom(addr, count);
-    for (int i = 0; i < count; i++)
+    // Always assume the read failed until proven otherwise. A failed
+    // requestFrom used to leave dest[] untouched (garbage) and could wedge the
+    // shared Wire bus, which then also broke the BQ25896 PPM on the same bus.
+    for (uint8_t i = 0; i < count; i++)
     {
-        dest[i] = wire->read();
+        dest[i] = 0;
     }
-    return true;
+
+    // A couple of retries keep a transient bus glitch (PMIC sharing Wire) from
+    // producing a random reading - the fuel gauge would then report 100%.
+    for (uint8_t attempt = 0; attempt < 3; attempt++)
+    {
+        wire->beginTransmission(addr);
+        wire->write(subAddress);
+        if (wire->endTransmission(true) != 0)
+        {
+            continue;
+        }
+
+        if (wire->requestFrom(addr, count) != count)
+        {
+            continue;
+        }
+
+        for (uint8_t i = 0; i < count; i++)
+        {
+            dest[i] = wire->read();
+        }
+        return true;
+    }
+
+    return false;
 }
 
 bool BQ27220::i2cWriteBytes(uint8_t subAddress, uint8_t *src, uint8_t count)
