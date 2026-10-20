@@ -6,7 +6,9 @@
 #include "modules/rfid/amiibo.h"
 #include "modules/rfid/chameleon.h"
 #include "modules/rfid/pn532ble.h"
+#if !defined(REMOVE_125KHZ_READER)
 #include "modules/rfid/rfid125.h"
+#endif
 #include "modules/rfid/srix_tool.h" //added for srix Tool
 #include "modules/rfid/tag_o_matic.h"
 
@@ -19,7 +21,9 @@ void RFIDMenu::optionsMenu() {
         {"Read tag",    [=]() { TagOMatic(); }                     },
 #ifndef LITE_VERSION
         {"Read EMV",    [=]() { EMVReader(); }                     },
+#if !defined(REMOVE_125KHZ_READER) // No LF antenna on this board's module
         {"Read 125kHz", [=]() { RFID125(); }                       },
+#endif
 #endif
         {"Scan tags",   [=]() { TagOMatic(TagOMatic::SCAN_MODE); } },
         {"Load file",   [=]() { TagOMatic(TagOMatic::LOAD_MODE); } },

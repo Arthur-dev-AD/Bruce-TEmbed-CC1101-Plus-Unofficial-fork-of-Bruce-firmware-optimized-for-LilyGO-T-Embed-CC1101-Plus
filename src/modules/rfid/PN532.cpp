@@ -391,8 +391,14 @@ int PN532::read(int cardBaudRate) {
 
     bool felica = false;
     if (cardBaudRate == PN532_MIFARE_ISO14443A) {
-        if (!nfc.startPassiveTargetIDDetection(cardBaudRate)) return TAG_NOT_PRESENT;
-        if (!nfc.readDetectedPassiveTargetID()) return FAILURE;
+        if (!nfc.startPassiveTargetIDDetection(cardBaudRate)) {
+            Serial.println("[NFC] read: no tag detected");
+            return TAG_NOT_PRESENT;
+        }
+        if (!nfc.readDetectedPassiveTargetID()) {
+            Serial.println("[NFC] read: readDetectedPassiveTargetID failed");
+            return FAILURE;
+        }
         format_data();
         set_uid();
     } else {
@@ -453,15 +459,28 @@ int PN532::erase() {
     if (!nfc.startPassiveTargetIDDetection()) return TAG_NOT_PRESENT;
     if (!nfc.readDetectedPassiveTargetID()) return FAILURE;
 
+    // Erase must classify the tag actually on the field - uid is unset when
+    // this mode is entered without reading a tag first.
+    if (printableUID.uid.isEmpty()) set_uid();
+
     return erase_data_blocks();
 }
 
 int PN532::write(int cardBaudRate) {
     if (cardBaudRate == PN532_MIFARE_ISO14443A) {
-        if (!nfc.startPassiveTargetIDDetection()) return TAG_NOT_PRESENT;
-        if (!nfc.readDetectedPassiveTargetID()) return FAILURE;
+        if (!nfc.startPassiveTargetIDDetection()) {
+            Serial.println("[NFC] write: no tag detected");
+            return TAG_NOT_PRESENT;
+        }
+        if (!nfc.readDetectedPassiveTargetID()) {
+            Serial.println("[NFC] write: readDetectedPassiveTargetID failed");
+            return FAILURE;
+        }
 
-        if (nfc.targetUid.sak != uid.sak) return TAG_NOT_MATCH;
+        if (nfc.targetUid.sak != uid.sak) {
+            Serial.printf("[NFC] write: tag mismatch (sak %02X != %02X)\n", nfc.targetUid.sak, uid.sak);
+            return TAG_NOT_MATCH;
+        }
     } else {
         uint16_t sys_code = 0xFFFF; // Default sys code for FeliCa
         uint8_t req_code = 0x01;    // Default request code for FeliCa
@@ -475,8 +494,18 @@ int PN532::write(int cardBaudRate) {
 }
 
 int PN532::write_ndef() {
-    if (!nfc.startPassiveTargetIDDetection()) return TAG_NOT_PRESENT;
-    if (!nfc.readDetectedPassiveTargetID()) return FAILURE;
+    if (!nfc.startPassiveTargetIDDetection()) {
+        Serial.println("[NFC] write_ndef: no tag detected");
+        return TAG_NOT_PRESENT;
+    }
+    if (!nfc.readDetectedPassiveTargetID()) {
+        Serial.println("[NFC] write_ndef: readDetectedPassiveTargetID failed");
+        return FAILURE;
+    }
+
+    // NDEF write targets whatever UL/NTAG tag is on the field; uid is unset
+    // when Write NDEF is entered without reading a tag first.
+    if (printableUID.uid.isEmpty()) set_uid();
 
     return write_ndef_blocks();
 }
@@ -1307,14 +1336,17 @@ int PN532::write_data_blocks() {
     int pageIndex;
     bool blockWriteSuccess;
     int totalSize = strAllPages.length();
+    String dataCopy = strAllPages;
+    lastFailedPage = -1;
 
-    while (strAllPages.length() > 0) {
-        lineBreakIndex = strAllPages.indexOf("\n");
+    int written = 0;
+    while (dataCopy.length() > 0) {
+        lineBreakIndex = dataCopy.indexOf("\n");
 
-        if (lineBreakIndex < 0) { break; } // Added for .JS and BugFix
+        if (lineBreakIndex < 0) { break; }
 
-        pageLine = strAllPages.substring(0, lineBreakIndex);
-        strAllPages = strAllPages.substring(lineBreakIndex + 1);
+        pageLine = dataCopy.substring(0, lineBreakIndex);
+        dataCopy = dataCopy.substring(lineBreakIndex + 1);
 
         pageIndex = pageLine.substring(5, pageLine.indexOf(":")).toInt();
         strBytes = pageLine.substring(pageLine.indexOf(":") + 1);
@@ -1342,42 +1374,192 @@ int PN532::write_data_blocks() {
             blockWriteSuccess = write_felica_data_block(pageIndex, strBytes);
         }
 
-        if (!blockWriteSuccess) return FAILURE;
+        if (!blockWriteSuccess) {
+            // Readable back => the tag is still there and its content did not
+            // verify; unreadable => the tag was taken away, so let the caller
+            // wait for it instead of reporting a bogus result.
+            byte probe[16] = {0};
+            bool tagReadable;
+            switch (uid.sak) {
+                case PICC_TYPE_MIFARE_MINI:
+                case PICC_TYPE_MIFARE_1K:
+                case PICC_TYPE_MIFARE_4K:
+                    tagReadable = read_mifare_classic_block_raw(pageIndex, probe);
+                    break;
 
-        progressHandler(totalSize - strAllPages.length(), totalSize, "Writing data blocks...");
+                case PICC_TYPE_MIFARE_UL:
+                    tagReadable = read_mifare_ultralight_block_raw(pageIndex, probe);
+                    break;
+
+                default: tagReadable = true; break; // FeliCa: no cheap read-back probe
+            }
+            if (!tagReadable) {
+                // Negative marker: the tag WAS detected, then the write was
+                // refused and it dropped off the field (or the PN532 released
+                // it). Distinct from a pure detection failure (-1).
+                Serial.printf("[NFC] blk %d: write refused, tag dropped off field\n", pageIndex);
+                lastFailedPage = -(pageIndex + 1);
+                return TAG_NOT_PRESENT;
+            }
+            Serial.printf("[NFC] blk %d: tag present but content bad -> FAILURE\n", pageIndex);
+            lastFailedPage = pageIndex;
+            return FAILURE;
+        }
+
+        written += (lineBreakIndex + 1);
+        progressHandler(written, totalSize, "Writing & verifying...");
     }
 
     return SUCCESS;
 }
 
+bool PN532::read_mifare_classic_block_raw(int block, byte *buffer) {
+    uint8_t tmp[16];
+    if (nfc.mifareclassic_ReadDataBlock(block, tmp)) {
+        for (int i = 0; i < 16; i++) buffer[i] = tmp[i];
+        return true;
+    }
+    if (!nfc.startPassiveTargetIDDetection()) return false;
+    if (!nfc.readDetectedPassiveTargetID()) return false;
+    if (authenticate_mifare_classic(block) != SUCCESS) return false;
+    if (nfc.mifareclassic_ReadDataBlock(block, tmp)) {
+        for (int i = 0; i < 16; i++) buffer[i] = tmp[i];
+        return true;
+    }
+    return false;
+}
+
+bool PN532::read_mifare_ultralight_block_raw(int block, byte *buffer) {
+    uint8_t tmp[16];
+    if (nfc.ntag2xx_ReadPage(block, tmp)) {
+        for (int i = 0; i < 4; i++) buffer[i] = tmp[i];
+        return true;
+    }
+    // A refused write can leave the PN532's in-listed target released - the
+    // tag is still on the field, it just needs to be selected again.
+    if (!nfc.startPassiveTargetIDDetection()) return false;
+    if (!nfc.readDetectedPassiveTargetID()) return false;
+    if (nfc.ntag2xx_ReadPage(block, tmp)) {
+        for (int i = 0; i < 4; i++) buffer[i] = tmp[i];
+        return true;
+    }
+    return false;
+}
+
+bool PN532::verify_mifare_classic_block(int block, const byte *expected) {
+    byte readbuf[16] = {0};
+    // A failed read (tag removed, auth lost) must NOT pass as "verified".
+    if (!read_mifare_classic_block_raw(block, readbuf)) return false;
+    for (int i = 0; i < 16; i++) {
+        if (readbuf[i] != expected[i]) return false;
+    }
+    return true;
+}
+
 bool PN532::write_mifare_classic_data_block(int block, String data) {
     data.replace(" ", "");
     byte size = data.length() / 2;
-    byte buffer[size];
+    byte buffer[16] = {0};
 
     if (size != 16) return false;
 
-    for (size_t i = 0; i < data.length(); i += 2) {
+    for (size_t i = 0; i < data.length() && i / 2 < 16; i += 2) {
         buffer[i / 2] = strtoul(data.substring(i, i + 2).c_str(), NULL, 16);
     }
 
     if (authenticate_mifare_classic(block) != SUCCESS) return false;
 
-    return nfc.mifareclassic_WriteDataBlock(block, buffer);
+    bool ok = nfc.mifareclassic_WriteDataBlock(block, buffer);
+    if (!ok) {
+        // retry
+        if (authenticate_mifare_classic(block) == SUCCESS) {
+            ok = nfc.mifareclassic_WriteDataBlock(block, buffer);
+        }
+    }
+    if (!ok) {
+        Serial.printf("[NFC] classic blk %d: write FAILED\n", block);
+        return false;
+    }
+
+    delay(10);
+    if (verify_mifare_classic_block(block, buffer)) {
+        Serial.printf("[NFC] classic blk %d: write+verify OK\n", block);
+        return true;
+    }
+
+    // retry write once, then verify again
+    Serial.printf("[NFC] classic blk %d: verify mismatch, retrying\n", block);
+    if (authenticate_mifare_classic(block) != SUCCESS) {
+        Serial.printf("[NFC] classic blk %d: re-auth FAILED\n", block);
+        return false;
+    }
+    if (!nfc.mifareclassic_WriteDataBlock(block, buffer)) {
+        Serial.printf("[NFC] classic blk %d: retry write FAILED\n", block);
+        return false;
+    }
+
+    delay(10);
+    bool verified = verify_mifare_classic_block(block, buffer);
+    Serial.printf("[NFC] classic blk %d: retry verify=%d\n", block, (int)verified);
+    return verified;
+}
+
+bool PN532::verify_mifare_ultralight_block(int block, const byte *expected) {
+    byte readbuf[4] = {0};
+    // A failed read (tag removed) must NOT pass as "verified".
+    if (!read_mifare_ultralight_block_raw(block, readbuf)) return false;
+    for (int i = 0; i < 4; i++) {
+        if (readbuf[i] != expected[i]) return false;
+    }
+    return true;
 }
 
 bool PN532::write_mifare_ultralight_data_block(int block, String data) {
     data.replace(" ", "");
     byte size = data.length() / 2;
-    byte buffer[size];
+    byte buffer[4] = {0};
 
     if (size != 4) return false;
 
-    for (size_t i = 0; i < data.length(); i += 2) {
+    for (size_t i = 0; i < data.length() && i / 2 < 4; i += 2) {
         buffer[i / 2] = strtoul(data.substring(i, i + 2).c_str(), NULL, 16);
     }
 
-    return nfc.ntag2xx_WritePage(block, buffer);
+    bool ok = nfc.ntag2xx_WritePage(block, buffer);
+    if (!ok) {
+        // Session may already be dead (target released by a previous refused
+        // write) - re-select the tag, then retry once.
+        if (nfc.startPassiveTargetIDDetection() && nfc.readDetectedPassiveTargetID()) {
+            ok = nfc.ntag2xx_WritePage(block, buffer);
+        }
+    }
+    if (!ok) {
+        Serial.printf("[NFC] UL blk %d: write FAILED\n", block);
+        return false;
+    }
+
+    delay(10);
+    if (verify_mifare_ultralight_block(block, buffer)) {
+        Serial.printf("[NFC] UL blk %d: write+verify OK\n", block);
+        return true;
+    }
+
+    // retry write once, then verify again
+    Serial.printf("[NFC] UL blk %d: verify mismatch, retrying\n", block);
+    // Re-select first: the refused exchange may have released the target.
+    if (!nfc.startPassiveTargetIDDetection() || !nfc.readDetectedPassiveTargetID()) {
+        Serial.printf("[NFC] UL blk %d: re-select FAILED\n", block);
+        return false;
+    }
+    if (!nfc.ntag2xx_WritePage(block, buffer)) {
+        Serial.printf("[NFC] UL blk %d: retry write FAILED\n", block);
+        return false;
+    }
+
+    delay(10);
+    bool verified = verify_mifare_ultralight_block(block, buffer);
+    Serial.printf("[NFC] UL blk %d: retry verify=%d\n", block, (int)verified);
+    return verified;
 }
 
 int PN532::write_felica_data_block(int block, String data) {
@@ -1416,16 +1598,35 @@ int PN532::erase_data_blocks() {
             }
             break;
 
-        case PICC_TYPE_MIFARE_UL:
-            // NDEF stardard
+        case PICC_TYPE_MIFARE_UL: {
+            // Detect the real memory size from the CC byte BEFORE erasing:
+            // writing past the end hits config/lock areas on NTAG clone chips
+            // (the Fudan NTAG213 that ships with the T-Embed included) and can
+            // permanently lock them. The old loop went up to page 129.
+            uint8_t cc[4] = {0};
+            byte lastUserPage = 39; // NTAG213: user memory is pages 4..39
+            if (nfc.mifareultralight_ReadPage(3, cc)) {
+                switch (cc[2]) {
+                    case 0x3E: lastUserPage = 129; break; // NTAG215
+                    case 0x6D: lastUserPage = 225; break; // NTAG216
+                    default: break;                       // NTAG213 / unknown
+                }
+            }
+
+            // NDEF standard
             blockWriteSuccess = write_mifare_ultralight_data_block(4, "03 00 FE 00");
             if (!blockWriteSuccess) return FAILURE;
 
-            for (byte i = 5; i < 130; i++) {
-                blockWriteSuccess = write_mifare_ultralight_data_block(i, "00 00 00 00");
-                if (!blockWriteSuccess) return FAILURE;
+            for (byte i = 5; i <= lastUserPage; i++) {
+                if (write_mifare_ultralight_data_block(i, "00 00 00 00")) continue;
+                // Locked pages (static lock bits) refuse the write but stay
+                // readable - skip them instead of aborting the whole erase.
+                byte probe[4] = {0};
+                if (read_mifare_ultralight_block_raw(i, probe)) continue;
+                return FAILURE;
             }
             break;
+        }
 
         default: break;
     }
@@ -1433,53 +1634,93 @@ int PN532::erase_data_blocks() {
     return SUCCESS;
 }
 
+bool PN532::write_ndef_page(int page, uint8_t *data) {
+    bool ok = nfc.ntag2xx_WritePage(page, data);
+    if (!ok) {
+        // Re-select if the session died, then retry once.
+        if (nfc.startPassiveTargetIDDetection() && nfc.readDetectedPassiveTargetID()) {
+            ok = nfc.ntag2xx_WritePage(page, data);
+        }
+    }
+    if (!ok) {
+        Serial.printf("[NFC] ndef page %d: write FAILED\n", page);
+        return false;
+    }
+
+    delay(10);
+    if (verify_mifare_ultralight_block(page, data)) {
+        Serial.printf("[NFC] ndef page %d: write+verify OK\n", page);
+        return true;
+    }
+
+    // retry write once, then verify again
+    Serial.printf("[NFC] ndef page %d: verify mismatch, retrying\n", page);
+    // Re-select first: the refused exchange may have released the target.
+    if (!nfc.startPassiveTargetIDDetection() || !nfc.readDetectedPassiveTargetID()) {
+        Serial.printf("[NFC] ndef page %d: re-select FAILED\n", page);
+        return false;
+    }
+    if (!nfc.ntag2xx_WritePage(page, data)) {
+        Serial.printf("[NFC] ndef page %d: retry write FAILED\n", page);
+        return false;
+    }
+
+    delay(10);
+    bool verified = verify_mifare_ultralight_block(page, data);
+    Serial.printf("[NFC] ndef page %d: retry verify=%d\n", page, (int)verified);
+    return verified;
+}
+
 int PN532::write_ndef_blocks() {
+    lastFailedPage = -1;
     if (uid.sak != PICC_TYPE_MIFARE_UL) return TAG_NOT_MATCH;
+
+    std::vector<uint8_t> ndef_payload;
 
     if (!rawNdefRecord.empty()) {
         // Record shapes ndefMessage can't hold - TLV-wrap generically instead.
         if (rawNdefRecord.size() > 254) return FAILURE; // single-byte TLV length only
         size_t ndef_size = rawNdefRecord.size() + 3;
         size_t payload_size = ndef_size % 4 == 0 ? ndef_size : ndef_size + (4 - (ndef_size % 4));
-        std::vector<uint8_t> ndef_payload(payload_size, 0);
+        ndef_payload.assign(payload_size, 0);
         ndef_payload[0] = 0x03;
         ndef_payload[1] = static_cast<uint8_t>(rawNdefRecord.size());
         std::copy(rawNdefRecord.begin(), rawNdefRecord.end(), ndef_payload.begin() + 2);
         ndef_payload[ndef_size - 1] = 0xFE;
+    } else {
+        size_t ndef_size = ndefMessage.messageSize + 3;
+        size_t payload_size = ndef_size % 4 == 0 ? ndef_size : ndef_size + (4 - (ndef_size % 4));
+        if (payload_size < 8) payload_size = 8; // header bytes [0..5] are always written
+        ndef_payload.assign(payload_size, 0);
+        ndef_payload[0] = ndefMessage.begin;
+        ndef_payload[1] = ndefMessage.messageSize;
+        ndef_payload[2] = ndefMessage.header;
+        ndef_payload[3] = ndefMessage.tnf;
+        ndef_payload[4] = ndefMessage.payloadSize;
+        ndef_payload[5] = ndefMessage.payloadType;
 
-        for (size_t i = 0; i < payload_size; i += 4) {
-            int block = 4 + (i / 4);
-            if (!nfc.ntag2xx_WritePage(block, ndef_payload.data() + i)) return FAILURE;
+        for (byte i = 0; i < ndefMessage.payloadSize; i++) {
+            ndef_payload[i + 6] = ndefMessage.payload[i];
         }
-        return SUCCESS;
+
+        ndef_payload[ndef_size - 1] = ndefMessage.end;
     }
 
-    byte ndef_size = ndefMessage.messageSize + 3;
-    byte payload_size = ndef_size % 4 == 0 ? ndef_size : ndef_size + (4 - (ndef_size % 4));
-    byte ndef_payload[payload_size];
-    byte i;
-    bool blockWriteSuccess;
-    uint8_t success;
-
-    ndef_payload[0] = ndefMessage.begin;
-    ndef_payload[1] = ndefMessage.messageSize;
-    ndef_payload[2] = ndefMessage.header;
-    ndef_payload[3] = ndefMessage.tnf;
-    ndef_payload[4] = ndefMessage.payloadSize;
-    ndef_payload[5] = ndefMessage.payloadType;
-
-    for (i = 0; i < ndefMessage.payloadSize; i++) { ndef_payload[i + 6] = ndefMessage.payload[i]; }
-
-    ndef_payload[ndef_size - 1] = ndefMessage.end;
-
-    if (payload_size > ndef_size) {
-        for (i = ndef_size; i < payload_size; i++) { ndef_payload[i] = 0; }
-    }
-
-    for (int i = 0; i < payload_size; i += 4) {
-        int block = 4 + (i / 4);
-        success = nfc.ntag2xx_WritePage(block, ndef_payload + i);
-        if (!success) return FAILURE;
+    for (size_t off = 0; off < ndef_payload.size(); off += 4) {
+        int block = 4 + (off / 4);
+        if (!write_ndef_page(block, ndef_payload.data() + off)) {
+            // Tag removed mid-write vs. content that could not be verified
+            byte probe[4] = {0};
+            if (!read_mifare_ultralight_block_raw(block, probe)) {
+                Serial.printf("[NFC] ndef page %d: write refused, tag dropped off field\n", block);
+                lastFailedPage = -(block + 1);
+                return TAG_NOT_PRESENT;
+            }
+            Serial.printf("[NFC] ndef page %d: tag present but content bad -> FAILURE\n", block);
+            lastFailedPage = block;
+            return FAILURE;
+        }
+        progressHandler((off / 4) + 1, ndef_payload.size() / 4, "Writing & verifying...");
     }
 
     return SUCCESS;

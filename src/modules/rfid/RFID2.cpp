@@ -563,16 +563,19 @@ int RFID2::write_data_blocks() {
     int pageIndex;
     bool blockWriteSuccess;
     int totalSize = strAllPages.length();
+    String dataCopy = strAllPages;
+    lastFailedPage = -1;
 
-    while (strAllPages.length() > 0) {
-        lineBreakIndex = strAllPages.indexOf("\n");
+    int written = 0;
+    while (dataCopy.length() > 0) {
+        lineBreakIndex = dataCopy.indexOf("\n");
 
-        if (lineBreakIndex < 0) { // ← Added for .JS and Bugfix
+        if (lineBreakIndex < 0) {
             break;
         }
 
-        pageLine = strAllPages.substring(0, lineBreakIndex);
-        strAllPages = strAllPages.substring(lineBreakIndex + 1);
+        pageLine = dataCopy.substring(0, lineBreakIndex);
+        dataCopy = dataCopy.substring(lineBreakIndex + 1);
 
         pageIndex = pageLine.substring(5, pageLine.indexOf(":")).toInt();
         strBytes = pageLine.substring(pageLine.indexOf(":") + 1);
@@ -596,44 +599,142 @@ int RFID2::write_data_blocks() {
             default: blockWriteSuccess = false; break;
         }
 
-        if (!blockWriteSuccess) return FAILURE;
+        if (!blockWriteSuccess) {
+            // Readable back => the tag is still there and its content did not
+            // verify; unreadable => the tag was taken away, so let the caller
+            // wait for it instead of reporting a bogus result.
+            byte probe[16] = {0};
+            bool tagReadable;
+            switch (piccType) {
+                case MFRC522::PICC_Type::PICC_TYPE_MIFARE_MINI:
+                case MFRC522::PICC_Type::PICC_TYPE_MIFARE_1K:
+                case MFRC522::PICC_Type::PICC_TYPE_MIFARE_4K:
+                    tagReadable = read_mifare_classic_block_raw(pageIndex, probe);
+                    break;
 
-        progressHandler(totalSize - strAllPages.length(), totalSize, "Writing data blocks...");
+                case MFRC522::PICC_Type::PICC_TYPE_MIFARE_UL:
+                    tagReadable = read_mifare_ultralight_block_raw(pageIndex, probe);
+                    break;
+
+                default: tagReadable = true; break;
+            }
+            if (!tagReadable) {
+                lastFailedPage = -(pageIndex + 1);
+                return TAG_NOT_PRESENT;
+            }
+            lastFailedPage = pageIndex;
+            return FAILURE;
+        }
+
+        written += (lineBreakIndex + 1);
+        progressHandler(written, totalSize, "Writing & verifying...");
     }
 
     return SUCCESS;
 }
 
+bool RFID2::read_mifare_classic_block_raw(int block, byte *buffer) {
+    byte byteCount = 18;
+    byte tmp[18];
+    if (mfrc522.MIFARE_Read((byte)block, tmp, &byteCount) == MFRC522::StatusCode::STATUS_OK) {
+        for (int i = 0; i < 16; i++) buffer[i] = tmp[i];
+        return true;
+    }
+    if (authenticate_mifare_classic(block) != SUCCESS) return false;
+    if (mfrc522.MIFARE_Read((byte)block, tmp, &byteCount) != MFRC522::StatusCode::STATUS_OK) return false;
+    for (int i = 0; i < 16; i++) buffer[i] = tmp[i];
+    return true;
+}
+
+bool RFID2::read_mifare_ultralight_block_raw(int block, byte *buffer) {
+    byte byteCount = 18;
+    byte tmp[18];
+    if (mfrc522.MIFARE_Read((byte)block, tmp, &byteCount) == MFRC522::StatusCode::STATUS_OK) {
+        for (int i = 0; i < 4; i++) buffer[i] = tmp[i];
+        return true;
+    }
+    return false;
+}
+
+bool RFID2::verify_mifare_classic_block(int block, const byte *expected) {
+    byte readbuf[16] = {0};
+    // A failed read (tag removed, auth lost) must NOT pass as "verified".
+    if (!read_mifare_classic_block_raw(block, readbuf)) return false;
+    for (int i = 0; i < 16; i++) {
+        if (readbuf[i] != expected[i]) return false;
+    }
+    return true;
+}
+
 bool RFID2::write_mifare_classic_data_block(int block, String data) {
     data.replace(" ", "");
     byte size = data.length() / 2;
-    byte buffer[size];
+    byte buffer[16] = {0};
 
-    for (size_t i = 0; i < data.length(); i += 2) {
+    if (size != 16) return false;
+
+    for (size_t i = 0; i < data.length() && i / 2 < 16; i += 2) {
         buffer[i / 2] = strtoul(data.substring(i, i + 2).c_str(), NULL, 16);
     }
 
     if (authenticate_mifare_classic(block) != SUCCESS) return false;
 
     byte status = mfrc522.MIFARE_Write((byte)block, buffer, size);
+    if (status != MFRC522::StatusCode::STATUS_OK) {
+        if (authenticate_mifare_classic(block) == SUCCESS) {
+            status = mfrc522.MIFARE_Write((byte)block, buffer, size);
+        }
+    }
     if (status != MFRC522::StatusCode::STATUS_OK) return false;
 
+    delay(10);
+    if (verify_mifare_classic_block(block, buffer)) return true;
+
+    // retry write once, then verify again
+    if (authenticate_mifare_classic(block) != SUCCESS) return false;
+    if (mfrc522.MIFARE_Write((byte)block, buffer, size) != MFRC522::StatusCode::STATUS_OK) return false;
+
+    delay(10);
+    return verify_mifare_classic_block(block, buffer);
+}
+
+bool RFID2::verify_mifare_ultralight_block(int block, const byte *expected) {
+    byte readbuf[4] = {0};
+    // A failed read (tag removed) must NOT pass as "verified".
+    if (!read_mifare_ultralight_block_raw(block, readbuf)) return false;
+    for (int i = 0; i < 4; i++) {
+        if (readbuf[i] != expected[i]) return false;
+    }
     return true;
 }
 
 bool RFID2::write_mifare_ultralight_data_block(int block, String data) {
     data.replace(" ", "");
     byte size = data.length() / 2;
-    byte buffer[size];
+    byte buffer[4] = {0};
 
-    for (size_t i = 0; i < data.length(); i += 2) {
+    if (size != 4) return false;
+
+    for (size_t i = 0; i < data.length() && i / 2 < 4; i += 2) {
         buffer[i / 2] = strtoul(data.substring(i, i + 2).c_str(), NULL, 16);
     }
 
     byte status = mfrc522.MIFARE_Ultralight_Write((byte)block, buffer, size);
+    if (status != MFRC522::StatusCode::STATUS_OK) {
+        status = mfrc522.MIFARE_Ultralight_Write((byte)block, buffer, size);
+    }
     if (status != MFRC522::StatusCode::STATUS_OK) return false;
 
-    return true;
+    delay(10);
+    if (verify_mifare_ultralight_block(block, buffer)) return true;
+
+    // retry write once, then verify again
+    if (mfrc522.MIFARE_Ultralight_Write((byte)block, buffer, size) != MFRC522::StatusCode::STATUS_OK) {
+        return false;
+    }
+
+    delay(10);
+    return verify_mifare_ultralight_block(block, buffer);
 }
 
 int RFID2::erase_data_blocks() {
@@ -652,16 +753,32 @@ int RFID2::erase_data_blocks() {
             }
             break;
 
-        case MFRC522::PICC_Type::PICC_TYPE_MIFARE_UL:
+        case MFRC522::PICC_Type::PICC_TYPE_MIFARE_UL: {
+            // Same as PN532: never write past the real end of memory - on NTAG
+            // clone chips that hits config/lock areas and can lock them for good.
+            uint8_t cc[4] = {0};
+            byte lastUserPage = 39; // NTAG213: user memory is pages 4..39
+            if (read_mifare_ultralight_block_raw(3, cc)) {
+                switch (cc[2]) {
+                    case 0x3E: lastUserPage = 129; break; // NTAG215
+                    case 0x6D: lastUserPage = 225; break; // NTAG216
+                    default: break;                       // NTAG213 / unknown
+                }
+            }
+
             // NDEF stardard
             blockWriteSuccess = write_mifare_ultralight_data_block(4, "03 00 FE 00");
             if (!blockWriteSuccess) return FAILURE;
 
-            for (byte i = 5; i < 130; i++) {
-                blockWriteSuccess = write_mifare_ultralight_data_block(i, "00 00 00 00");
-                if (!blockWriteSuccess) return FAILURE;
+            for (byte i = 5; i <= lastUserPage; i++) {
+                if (write_mifare_ultralight_data_block(i, "00 00 00 00")) continue;
+                // Locked pages refuse the write but stay readable - skip them.
+                byte probe[4] = {0};
+                if (read_mifare_ultralight_block_raw(i, probe)) continue;
+                return FAILURE;
             }
             break;
+        }
 
         default: break;
     }
@@ -669,9 +786,29 @@ int RFID2::erase_data_blocks() {
     return SUCCESS;
 }
 
+bool RFID2::write_ndef_page(int page, uint8_t *data) {
+    if (mfrc522.MIFARE_Ultralight_Write((byte)page, data, 4) != MFRC522::StatusCode::STATUS_OK) {
+        return false;
+    }
+
+    delay(10);
+    if (verify_mifare_ultralight_block(page, data)) return true;
+
+    // retry write once, then verify again
+    if (mfrc522.MIFARE_Ultralight_Write((byte)page, data, 4) != MFRC522::StatusCode::STATUS_OK) {
+        return false;
+    }
+
+    delay(10);
+    return verify_mifare_ultralight_block(page, data);
+}
+
 int RFID2::write_ndef_blocks() {
     byte piccType = mfrc522.PICC_GetType(mfrc522.uid.sak);
+    lastFailedPage = -1;
     if (piccType != MFRC522::PICC_Type::PICC_TYPE_MIFARE_UL) return TAG_NOT_MATCH;
+
+    std::vector<uint8_t> ndef_payload;
 
     if (!rawNdefRecord.empty()) {
         // Record shapes ndefMessage can't hold (MIME/WSC Wi-Fi records, etc.) -
@@ -680,45 +817,43 @@ int RFID2::write_ndef_blocks() {
         if (rawNdefRecord.size() > 254) return FAILURE; // single-byte TLV length only
         size_t ndef_size = rawNdefRecord.size() + 3;
         size_t payload_size = ndef_size % 4 == 0 ? ndef_size : ndef_size + (4 - (ndef_size % 4));
-        std::vector<uint8_t> ndef_payload(payload_size, 0);
+        ndef_payload.assign(payload_size, 0);
         ndef_payload[0] = 0x03;
         ndef_payload[1] = static_cast<uint8_t>(rawNdefRecord.size());
         std::copy(rawNdefRecord.begin(), rawNdefRecord.end(), ndef_payload.begin() + 2);
         ndef_payload[ndef_size - 1] = 0xFE;
+    } else {
+        size_t ndef_size = ndefMessage.messageSize + 3;
+        size_t payload_size = ndef_size % 4 == 0 ? ndef_size : ndef_size + (4 - (ndef_size % 4));
+        if (payload_size < 8) payload_size = 8; // header bytes [0..5] are always written
+        ndef_payload.assign(payload_size, 0);
+        ndef_payload[0] = ndefMessage.begin;
+        ndef_payload[1] = ndefMessage.messageSize;
+        ndef_payload[2] = ndefMessage.header;
+        ndef_payload[3] = ndefMessage.tnf;
+        ndef_payload[4] = ndefMessage.payloadSize;
+        ndef_payload[5] = ndefMessage.payloadType;
 
-        for (size_t i = 0; i < payload_size; i += 4) {
-            int block = 4 + (i / 4);
-            byte status = mfrc522.MIFARE_Ultralight_Write((byte)block, ndef_payload.data() + i, 4);
-            if (status != MFRC522::StatusCode::STATUS_OK) return FAILURE;
+        for (byte i = 0; i < ndefMessage.payloadSize; i++) {
+            ndef_payload[i + 6] = ndefMessage.payload[i];
         }
-        return SUCCESS;
+
+        ndef_payload[ndef_size - 1] = ndefMessage.end;
     }
 
-    byte ndef_size = ndefMessage.messageSize + 3;
-    byte payload_size = ndef_size % 4 == 0 ? ndef_size : ndef_size + (4 - (ndef_size % 4));
-    byte ndef_payload[payload_size];
-    byte i;
-    bool blockWriteSuccess;
-
-    ndef_payload[0] = ndefMessage.begin;
-    ndef_payload[1] = ndefMessage.messageSize;
-    ndef_payload[2] = ndefMessage.header;
-    ndef_payload[3] = ndefMessage.tnf;
-    ndef_payload[4] = ndefMessage.payloadSize;
-    ndef_payload[5] = ndefMessage.payloadType;
-
-    for (i = 0; i < ndefMessage.payloadSize; i++) { ndef_payload[i + 6] = ndefMessage.payload[i]; }
-
-    ndef_payload[ndef_size - 1] = ndefMessage.end;
-
-    if (payload_size > ndef_size) {
-        for (i = ndef_size; i < payload_size; i++) { ndef_payload[i] = 0; }
-    }
-
-    for (int i = 0; i < payload_size; i += 4) {
-        int block = 4 + (i / 4);
-        byte status = mfrc522.MIFARE_Ultralight_Write((byte)block, ndef_payload + i, 4);
-        if (status != MFRC522::StatusCode::STATUS_OK) return FAILURE;
+    for (size_t off = 0; off < ndef_payload.size(); off += 4) {
+        int block = 4 + (off / 4);
+        if (!write_ndef_page(block, ndef_payload.data() + off)) {
+            // Tag removed mid-write vs. content that could not be verified
+            byte probe[4] = {0};
+            if (!read_mifare_ultralight_block_raw(block, probe)) {
+                lastFailedPage = -(block + 1);
+                return TAG_NOT_PRESENT;
+            }
+            lastFailedPage = block;
+            return FAILURE;
+        }
+        progressHandler((off / 4) + 1, ndef_payload.size() / 4, "Writing & verifying...");
     }
 
     return SUCCESS;

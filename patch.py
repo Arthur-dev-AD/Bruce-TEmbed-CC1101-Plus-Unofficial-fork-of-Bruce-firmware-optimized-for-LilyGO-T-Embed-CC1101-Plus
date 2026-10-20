@@ -25,32 +25,32 @@ if not isfile(join(FRAMEWORK_DIR,mcu, "lib", ".patched")):
         FRAMEWORK_DIR, mcu, "lib", "libnet80211.a.patched"
     )
 
-    if mcu=="esp32c5" or mcu=="esp32c6" :
-        env.Execute(
-            "pio pkg exec -p toolchain-riscv32-esp -- riscv32-esp-elf-objcopy  --weaken-symbol=ieee80211_raw_frame_sanity_check %s %s"
-            % (original_file, patched_file)
-        )
-    elif mcu=="esp32p4":
-        """Do nothing"""
-    else:
-        env.Execute(
-            "pio pkg exec -p toolchain-xtensa-%s -- xtensa-%s-elf-objcopy  --weaken-symbol=ieee80211_raw_frame_sanity_check %s %s"
-            % (mcu, mcu, original_file, patched_file)
-        )
+    if mcu != "esp32p4":
+        if mcu=="esp32c5" or mcu=="esp32c6" :
+            env.Execute(
+                "pio pkg exec -p toolchain-riscv32-esp -- riscv32-esp-elf-objcopy  --weaken-symbol=ieee80211_raw_frame_sanity_check %s %s"
+                % (original_file, patched_file)
+            )
+        else:
+            env.Execute(
+                "pio pkg exec -p toolchain-xtensa-%s -- xtensa-%s-elf-objcopy  --weaken-symbol=ieee80211_raw_frame_sanity_check %s %s"
+                % (mcu, mcu, original_file, patched_file)
+            )
 
-    if isfile("%s.old" % (original_file)):
-        remove("%s.old" % (original_file))
+        if not isfile(patched_file):
+            # objcopy failed: keep the original library in place and leave the
+            # ".patched" flag unset so the patch is retried on the next build.
+            raise RuntimeError("Patch: objcopy did not produce %s" % patched_file)
 
-    if isfile(original_file):
-        rename(original_file, "%s.old" % (original_file))
-    else:
-        print("Patch: Original file not found")
+        if isfile("%s.old" % (original_file)):
+            remove("%s.old" % (original_file))
 
-    if isfile(patched_file):
+        if isfile(original_file):
+            rename(original_file, "%s.old" % (original_file))
+        else:
+            raise RuntimeError("Patch: Original file not found: %s" % original_file)
+
         rename(patched_file, original_file)
-    else:
-        print("Patch: Patched file not found")
-
 
     def _touch(path):
         with open(path, "w") as fp:

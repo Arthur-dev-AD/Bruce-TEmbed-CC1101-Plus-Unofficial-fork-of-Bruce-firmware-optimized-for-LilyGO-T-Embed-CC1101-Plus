@@ -177,6 +177,21 @@ conflicts = [
         r'\(devLimit == 0U\) \? RFAL_NFCA_N_RETRANS : 0U',
         '/* Bruce: always retry, see patch_library_conflicts.py */ RFAL_NFCA_N_RETRANS'
     ),
+    # Bruce board variants (boards/*/pins_arduino.h) define font-size macros FP/FM/FG.
+    # FastLED 3.10.x uses `FP` as a fixed-point type alias inside its own translation
+    # units, so the macro breaks every fl/build/*.cpp unit on boards that define FP
+    # (lilygo-t-embed-cc1101, m5stack-cores3, lilygo-t-hmi, ...). Undefine FP right
+    # after FastLED pulls in Arduino.h, but only in FastLED's internal units: public
+    # FastLED.h consumers must keep seeing the board's FP font-size macro.
+    (
+        ".pio/libdeps/*/FastLED/src/fl/build/*.cpp",
+        r'(#include "fl/system/arduino\.h"\r?\n)(?!// bruce-fp-undef-begin)',
+        r'\1// bruce-fp-undef-begin\n'
+        '#ifdef FP\n'
+        '#undef FP\n'
+        '#endif\n'
+        '// bruce-fp-undef-end\n'
+    ),
     # The WUPA sent at the top of rfalNfcaPollerFullCollisionResolution() (the anti-collision
     # pass POLL_COLAVOIDANCE actually runs, heavier than the lightweight TECHDETECT probe) had no
     # retry wrapper at all - unlike the SDD_REQ/SEL_REQ calls below it, a single missed/late
@@ -199,6 +214,50 @@ conflicts = [
         ".pio/libdeps/*/NFC-RFAL-fork/src/rfal_nfca.cpp",
         r'#define RFAL_NFCA_N_RETRANS         2U',
         '#define RFAL_NFCA_N_RETRANS         4U'
+    ),
+    # Adafruit PN532: the write helpers (mifareclassic_WriteDataBlock,
+    # mifareultralight_WritePage, ntag2xx_WritePage) read the INDATAEXCHANGE
+    # response packet but never look at its status byte (pn532_packetbuffer[7]).
+    # Making them hard-fail on a non-zero status broke writes on PN532 units that
+    # report a non-zero byte even on success, so the patch only *logs* the value:
+    # Bruce's own read-back verify (PN532.cpp / RFID2.cpp) is the real check.
+    (
+        ".pio/libdeps/*/Adafruit PN532/Adafruit_PN532.cpp",
+        r'delay\(10\);\r?\n\r?\n  /\* Read the response packet \*/\r?\n  readdata\(pn532_packetbuffer, 26\);\r?\n\r?\n  // Return OK Signal\r?\n  return 1;',
+        'delay(10);\n'
+        '\n'
+        '  /* Read the response packet */\n'
+        '  readdata(pn532_packetbuffer, 26);\n'
+        '\n'
+        '  // Bruce: log-only, see patch_library_conflicts.py - Bruce\'s own read-back\n'
+        '  // verify (PN532.cpp/RFID2.cpp) is the real check; returning 0 here broke\n'
+        '  // writes on units that report a non-zero status byte on success.\n'
+        '  // bruce-nfc-write-status-begin\n'
+        '  if (pn532_packetbuffer[7] != 0x00) {\n'
+        '    Serial.print(F("PN532 write status=0x"));\n'
+        '    Serial.println(pn532_packetbuffer[7], HEX);\n'
+        '  }\n'
+        '  // bruce-nfc-write-status-end\n'
+        '  return 1;'
+    ),
+    (
+        ".pio/libdeps/*/Adafruit PN532/Adafruit_PN532.cpp",
+        r'delay\(10\);\r?\n\r?\n  /\* Read the response packet \*/\r?\n  readdata\(pn532_packetbuffer, 26\);\r?\n\r?\n  return 1;',
+        'delay(10);\n'
+        '\n'
+        '  /* Read the response packet */\n'
+        '  readdata(pn532_packetbuffer, 26);\n'
+        '\n'
+        '  // Bruce: log-only, see patch_library_conflicts.py - Bruce\'s own read-back\n'
+        '  // verify (PN532.cpp/RFID2.cpp) is the real check; returning 0 here broke\n'
+        '  // writes on units that report a non-zero status byte on success.\n'
+        '  // bruce-nfc-write-status-begin\n'
+        '  if (pn532_packetbuffer[7] != 0x00) {\n'
+        '    Serial.print(F("PN532 write status=0x"));\n'
+        '    Serial.println(pn532_packetbuffer[7], HEX);\n'
+        '  }\n'
+        '  // bruce-nfc-write-status-end\n'
+        '  return 1;'
     ),
 ]
 

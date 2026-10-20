@@ -66,7 +66,12 @@ private:
     int write_data_blocks();
     bool write_mifare_classic_data_block(int block, String data);
     bool write_mifare_ultralight_data_block(int block, String data);
+    bool read_mifare_classic_block_raw(int block, byte *buffer);
+    bool read_mifare_ultralight_block_raw(int block, byte *buffer);
+    bool verify_mifare_classic_block(int block, const byte *expected);
+    bool verify_mifare_ultralight_block(int block, const byte *expected);
 
     int erase_data_blocks();
     int write_ndef_blocks();
+    bool write_ndef_page(int page, uint8_t *data);
 };

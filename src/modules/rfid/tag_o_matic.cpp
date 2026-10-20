@@ -35,6 +35,14 @@ void displaySmallErrorToast(const String &txt) {
     tft.setTextSize(textSize);
     tft.drawCentreString(txt, tftWidth / 2, boxY + 5);
 }
+
+// -1 = no write attempted (pure detection failure); >= 0 = write refused but
+// tag still readable; < -1 = write refused and tag dropped off the field.
+String writeWaitToast(RFIDInterface *rfid) {
+    if (rfid->lastFailedPage < -1) return "Lost tag at page " + String(-rfid->lastFailedPage - 1);
+    if (rfid->lastFailedPage >= 0) return "Write failed: page " + String(rfid->lastFailedPage);
+    return "Waiting for tag...";
+}
 } // namespace
 
 TagOMatic::TagOMatic() {
@@ -80,6 +88,7 @@ void TagOMatic::set_rfid_module() {
 void TagOMatic::setup() {
     returnToMenu = false;
     set_rfid_module();
+    Serial.printf("[NFC] TagOMatic start, rfidModule=%d\n", (int)bruceConfigPins.rfidModule);
 
     if (!_rfid->begin()) {
         displayError("RFID module not found!", true);
@@ -479,10 +488,16 @@ void TagOMatic::write_custom_uid() {
 }
 
 void TagOMatic::erase_card() {
+    if (millis() - _lastReadTime < 250) return;
+    _lastReadTime = millis();
+
     int result = _rfid->erase();
 
     switch (result) {
-        case RFIDInterface::TAG_NOT_PRESENT: return; break;
+        case RFIDInterface::TAG_NOT_PRESENT:
+            displaySmallErrorToast(writeWaitToast(_rfid));
+            return;
+            break;
         case RFIDInterface::SUCCESS: displaySuccess("Tag erased successfully.", true); break;
         default: displayError("Error erasing data from tag."); break;
     }
@@ -492,7 +507,13 @@ void TagOMatic::erase_card() {
 }
 
 void TagOMatic::write_data() {
+    // Mirror read mode's throttle: hammering INLISTPASSIVETARGET back-to-back
+    // leaves the PN532 no time to actually poll the field.
+    if (millis() - _lastReadTime < 250) return;
+    _lastReadTime = millis();
+
     int result = -1;
+    _rfid->lastFailedPage = -1;
     if (_rfid->printableUID.picc_type != "FeliCa") {
         result = _rfid->write();
     } else {
@@ -500,10 +521,18 @@ void TagOMatic::write_data() {
     }
 
     switch (result) {
-        case RFIDInterface::TAG_NOT_PRESENT: return; break;
+        case RFIDInterface::TAG_NOT_PRESENT:
+            displaySmallErrorToast(writeWaitToast(_rfid));
+            return;
+            break;
         case RFIDInterface::TAG_NOT_MATCH: displayError("Tag types do not match."); break;
         case RFIDInterface::SUCCESS: displaySuccess("Tag written successfully."); break;
-        default: displayError("Error writing data to tag."); break;
+        default:
+            displayError(
+                _rfid->lastFailedPage >= 0 ? "Write failed at page " + String(_rfid->lastFailedPage)
+                                           : "Error writing data to tag."
+            );
+            break;
     }
 
     delayWithReturn(1000);
@@ -517,13 +546,25 @@ void TagOMatic::write_ndef_data() {
         dump_ndef_details();
     }
 
+    if (millis() - _lastReadTime < 250) return;
+    _lastReadTime = millis();
+
+    _rfid->lastFailedPage = -1;
     int result = _rfid->write_ndef();
 
     switch (result) {
-        case RFIDInterface::TAG_NOT_PRESENT: return; break;
+        case RFIDInterface::TAG_NOT_PRESENT:
+            displaySmallErrorToast(writeWaitToast(_rfid));
+            return;
+            break;
         case RFIDInterface::TAG_NOT_MATCH: displayError("Tag is not MIFARE Ultralight."); break;
         case RFIDInterface::SUCCESS: displaySuccess("Tag written successfully."); break;
-        default: displayError("Error writing data to tag."); break;
+        default:
+            displayError(
+                _rfid->lastFailedPage >= 0 ? "Write failed at page " + String(_rfid->lastFailedPage)
+                                           : "Error writing data to tag."
+            );
+            break;
     }
 
     delayWithReturn(1000);

@@ -7,12 +7,8 @@
 #include "menu_items/ClockMenu.h"
 #include "menu_items/ConfigMenu.h"
 #include "menu_items/ConnectMenu.h"
-#include "menu_items/EthernetMenu.h"
-#include "menu_items/FMMenu.h"
 #include "menu_items/FileMenu.h"
-#include "menu_items/GpsMenu.h"
 #include "menu_items/IRMenu.h"
-#include "menu_items/LoRaMenu.h"
 #include "menu_items/NRF24.h"
 #include "menu_items/OthersMenu.h"
 #include "menu_items/RFIDMenu.h"
@@ -26,8 +22,6 @@ public:
     ClockMenu clockMenu;
     ConnectMenu connectMenu;
     ConfigMenu configMenu;
-    FMMenu fmMenu;
-    GpsMenu gpsMenu;
     IRMenu irMenu;
     NRF24Menu nrf24Menu;
     OthersMenu othersMenu;
@@ -35,10 +29,6 @@ public:
     RFMenu rfMenu;
     ScriptsMenu scriptsMenu;
     WifiMenu wifiMenu;
-#if !defined(LITE_VERSION)
-    LoRaMenu loraMenu;
-    EthernetMenu ethernetMenu;
-#endif
 
     MainMenu();
     ~MainMenu();

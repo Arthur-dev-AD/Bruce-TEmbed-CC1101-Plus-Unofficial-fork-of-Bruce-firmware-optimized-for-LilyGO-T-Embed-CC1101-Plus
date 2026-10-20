@@ -81,6 +81,9 @@ public:
     int dataPages = 0;
     bool pageReadSuccess = false;
     int pageReadStatus = FAILURE;
+    // Page/block that made the last write attempt fail (-1 = none). Shown on
+    // screen so a refused write can be told apart from "no tag detected".
+    int lastFailedPage = -1;
 
     virtual ~RFIDInterface() {} // Virtual destructor
 
