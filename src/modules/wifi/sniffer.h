@@ -73,6 +73,7 @@ void openFile(FS &Fs);
 bool writeHeader(File file);
 
 void sniffer_setup();
+void sniffer_teardown();
 
 void sniffer(void *buf, wifi_promiscuous_pkt_type_t type);
 

@@ -77,9 +77,13 @@ FS *activeFs = &LittleFS;
 SemaphoreHandle_t fileMutex = nullptr;
 QueueHandle_t snifferQueue = nullptr;
 TaskHandle_t snifferWriterHandle = nullptr;
+volatile bool snifferWriterStopped = false;
+volatile bool snifferShuttingDown = false;
 StaticSemaphore_t fileMutexBuffer;
 SemaphoreHandle_t handshakeMutex = nullptr;
 StaticSemaphore_t handshakeMutexBuffer;
+SemaphoreHandle_t hsDataMutex = nullptr;
+StaticSemaphore_t hsDataMutexBuffer;
 std::set<BeaconList> registeredBeacons;
 std::set<String> SavedHS; // Saves the MAC of beacon HS detected in the session
 String filename = "/BrucePCAP/" + (String)FILENAME + ".pcap";
@@ -107,8 +111,11 @@ struct Eapol4WayBuffer {
     EapolFrame m1;
     EapolFrame m2;
     EapolFrame m3;
+    uint32_t lastActivityMs = 0;
 };
 std::map<uint64_t, Eapol4WayBuffer> eapol4WayBuffer;
+constexpr size_t MAX_EAPOL_BUFFERS = 32;
+constexpr uint32_t EAPOL_BUFFER_TIMEOUT_MS = 30000;
 
 // --- Raw beacon cache (per AP) ---
 // Keeps the last beacon frame seen for an AP so it can be written as the
@@ -147,6 +154,7 @@ struct SnifferQueueItem {
     bool saveRaw = false;
     bool saveHandshake = false;
     bool saveDeauth = false;
+    bool stop = false;
     uint8_t bssid[6] = {0};
     char ssid[MAX_CAPTURE_SSID_LEN + 1] = {0};
 };
@@ -164,6 +172,7 @@ struct FrameInfo {
 
 static bool ensureSnifferBackend();
 static void snifferWriterTask(void *param);
+static void pruneIncompleteHandshakes();
 static wifi_promiscuous_pkt_t *duplicatePacket(const wifi_promiscuous_pkt_t *pkt, uint16_t length);
 static void releasePacketCopy(wifi_promiscuous_pkt_t *packet);
 static uint64_t macToKey(const void *mac); // changed to const void *
@@ -338,8 +347,14 @@ void saveHandshake(const wifi_promiscuous_pkt_t *packet, bool beacon, FS &Fs, co
     int eapolMsg = classifyEapolMessage(packet);
     if (eapolMsg < 1 || eapolMsg > 4) { return; }
 
+    if (eapol4WayBuffer.find(apKey) == eapol4WayBuffer.end() &&
+        eapol4WayBuffer.size() >= MAX_EAPOL_BUFFERS) {
+        return;
+    }
+
     auto &tracker = perApHandshakeTracker[apKey];
     auto &buf = eapol4WayBuffer[apKey];
+    buf.lastActivityMs = millis();
     uint16_t dataLen = std::min<uint16_t>(packet->rx_ctrl.sig_len, EAPOL_BUF_SIZE);
 
     // M1: buffer — don't write to file yet
@@ -388,6 +403,7 @@ void saveHandshake(const wifi_promiscuous_pkt_t *packet, bool beacon, FS &Fs, co
         File f = Fs.open(filePath, FILE_APPEND);
         if (!f) {
             eapol4WayBuffer.erase(apKey);
+            perApHandshakeTracker.erase(apKey);
             return;
         }
 
@@ -432,6 +448,7 @@ void saveHandshake(const wifi_promiscuous_pkt_t *packet, bool beacon, FS &Fs, co
 
         f.close();
         eapol4WayBuffer.erase(apKey);
+        perApHandshakeTracker.erase(apKey);
 
         if (handshakeReadyBssids.find(apKey) == handshakeReadyBssids.end()) { num_HS++; }
         markHandshakeReady(apKey);
@@ -784,9 +801,11 @@ static String currentModeString() {
 static bool ensureSnifferBackend() {
     if (!fileMutex) { fileMutex = xSemaphoreCreateMutexStatic(&fileMutexBuffer); }
     if (!handshakeMutex) { handshakeMutex = xSemaphoreCreateMutexStatic(&handshakeMutexBuffer); }
+    if (!hsDataMutex) { hsDataMutex = xSemaphoreCreateMutexStatic(&hsDataMutexBuffer); }
     if (!snifferQueue) { snifferQueue = xQueueCreate(SNIFFER_QUEUE_DEPTH, sizeof(SnifferQueueItem)); }
     if (!snifferQueue) { return false; }
     if (!snifferWriterHandle) {
+        snifferWriterStopped = false;
 #if SOC_CPU_CORES_NUM > 1
         BaseType_t res = xTaskCreatePinnedToCore(
             snifferWriterTask, "sniff_writer", 4096, nullptr, 4, &snifferWriterHandle, 1
@@ -810,7 +829,23 @@ static void handleRawWrite(const SnifferQueueItem &item) {
 
 static void handleHandshakeWrite(const SnifferQueueItem &item) {
     if (!handshakeCaptureEnabled() || !item.packet) { return; }
+    bool locked = hsDataMutex && xSemaphoreTake(hsDataMutex, pdMS_TO_TICKS(100)) == pdTRUE;
     saveHandshake(item.packet, item.isBeacon, *activeFs, item.ssid);
+    if (locked) { xSemaphoreGive(hsDataMutex); }
+}
+
+static void pruneIncompleteHandshakes() {
+    if (!hsDataMutex || xSemaphoreTake(hsDataMutex, pdMS_TO_TICKS(50)) != pdTRUE) { return; }
+    uint32_t now = millis();
+    for (auto it = eapol4WayBuffer.begin(); it != eapol4WayBuffer.end();) {
+        if ((uint32_t)(now - it->second.lastActivityMs) > EAPOL_BUFFER_TIMEOUT_MS) {
+            perApHandshakeTracker.erase(it->first);
+            it = eapol4WayBuffer.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    xSemaphoreGive(hsDataMutex);
 }
 
 static void handleDeauthWrite(const SnifferQueueItem &item) {
@@ -825,13 +860,18 @@ static void snifferWriterTask(void *param) {
     (void)param;
     SnifferQueueItem item;
     while (true) {
-        if (xQueueReceive(snifferQueue, &item, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(snifferQueue, &item, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            if (item.stop) { break; }
             if (item.saveRaw) { handleRawWrite(item); }
             if (item.saveHandshake) { handleHandshakeWrite(item); }
             if (item.saveDeauth) { handleDeauthWrite(item); }
             releasePacketCopy(item.packet);
+        } else {
+            pruneIncompleteHandshakes();
         }
     }
+    snifferWriterStopped = true;
+    vTaskDelete(nullptr);
 }
 
 bool sniffer_prepare_storage(FS *fs, bool sdDetectedParam) {
@@ -879,6 +919,50 @@ void sniffer_wait_for_flush(uint32_t timeoutMs) {
     }
 }
 
+static void clearSnifferCaches() {
+    SavedHS.clear();
+    handshakeBeaconLogged.clear();
+    handshakeReadyBssids.clear();
+    perApHandshakeTracker.clear();
+    eapol4WayBuffer.clear();
+    beaconRawCache.clear();
+    beaconSsidCache.clear();
+    beaconLastSeen.clear();
+    registeredBeacons.clear();
+}
+
+void sniffer_teardown() {
+    snifferShuttingDown = true;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (snifferQueue && snifferWriterHandle) {
+        SnifferQueueItem stopItem;
+        stopItem.stop = true;
+        if (xQueueSend(snifferQueue, &stopItem, pdMS_TO_TICKS(1500)) == pdTRUE) {
+            for (int i = 0; i < 1000 && !snifferWriterStopped; ++i) { vTaskDelay(pdMS_TO_TICKS(10)); }
+        }
+    }
+    if (snifferWriterStopped) {
+        snifferWriterHandle = nullptr;
+        snifferWriterStopped = false;
+    }
+    if (snifferWriterHandle) {
+        vTaskDelete(snifferWriterHandle);
+        snifferWriterHandle = nullptr;
+    }
+    if (snifferQueue) {
+        vQueueDelete(snifferQueue);
+        snifferQueue = nullptr;
+    }
+
+    closeRawFile();
+    closeDeauthFile();
+    clearSnifferCaches();
+    snifferShuttingDown = false;
+}
+
 void sniffer_reset_handshake_cache() {
     if (handshakeMutex && xSemaphoreTake(handshakeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         SavedHS.clear();
@@ -888,8 +972,14 @@ void sniffer_reset_handshake_cache() {
     }
     resetHandshakeTracking();
     resetHandshakeBeaconCache();
-    perApHandshakeTracker.clear();
-    eapol4WayBuffer.clear();
+    if (hsDataMutex && xSemaphoreTake(hsDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        perApHandshakeTracker.clear();
+        eapol4WayBuffer.clear();
+        xSemaphoreGive(hsDataMutex);
+    } else {
+        perApHandshakeTracker.clear();
+        eapol4WayBuffer.clear();
+    }
 }
 
 void printAddress(const uint8_t *addr) {
@@ -945,6 +1035,7 @@ bool writeHeader(File file) {
 /* will be executed on every packet the ESP32 gets while being in promiscuous mode */
 // Sniffer callback
 void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (snifferShuttingDown) { return; }
     if (!snifferQueue && !ensureSnifferBackend()) { return; }
     // If using LittleFS to save .pcaps and storage is exhausted, stop promiscuous mode
     if (isLittleFS && !littleFsSpaceAvailable) {
@@ -1463,12 +1554,10 @@ void sniffer_setup() {
     }
 Exit:
     esp_wifi_set_promiscuous(false);
-    esp_wifi_stop();
     esp_wifi_set_promiscuous_rx_cb(NULL);
+    esp_wifi_stop();
     // DO NOT call esp_wifi_deinit() here - let wifi_common.h handle it
-    sniffer_wait_for_flush(1000);
-    closeRawFile();
-    closeDeauthFile();
+    sniffer_teardown();
     wifiDisconnect();
     vTaskDelay(1 / portTICK_RATE_MS);
 }

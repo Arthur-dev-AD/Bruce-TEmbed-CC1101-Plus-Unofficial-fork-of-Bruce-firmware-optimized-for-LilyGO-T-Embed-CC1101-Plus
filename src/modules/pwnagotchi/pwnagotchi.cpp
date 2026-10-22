@@ -421,12 +421,10 @@ void brucegotchi_start() {
     }
 
     // Cleanup — everything must be fully stopped
-    sniffer_wait_for_flush(2000);            // drain any pending handshake writes
     esp_wifi_set_promiscuous(false);         // stop promiscuous capture
     esp_wifi_set_promiscuous_rx_cb(nullptr); // remove sniffer callback
     wifiDisconnect();                        // fully stop WiFi (AP + STA + mode OFF)
-    registeredBeacons.clear();               // clear AP beacon list
+    sniffer_teardown();                      // free writer task, queue and caches
     clearPwngridPeers();                     // clear pwngrid peer list
-    sniffer_reset_handshake_cache();         // clear handshake tracking state
 }
 #endif
