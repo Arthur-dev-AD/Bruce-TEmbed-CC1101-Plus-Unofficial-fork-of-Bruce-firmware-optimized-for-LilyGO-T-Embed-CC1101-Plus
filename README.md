@@ -16,8 +16,11 @@ Two images are committed at the repository root:
 
 | File | Purpose | Flash offset |
 | --- | --- | --- |
-| `Bruce-lilygo-t-embed-cc1101-app.bin` | Application image, for **dual-boot / launcher** setups | `0x10000` |
-| `Bruce-lilygo-t-embed-cc1101.bin` | Full factory image (bootloader + partitions + app), for a **clean single-boot** install | `0x0` |
+| [`Bruce-lilygo-t-embed-cc1101-app.bin`](Bruce-lilygo-t-embed-cc1101-app.bin) | Application image, for **dual-boot / launcher** setups | `0x10000` |
+| [`Bruce-lilygo-t-embed-cc1101.bin`](Bruce-lilygo-t-embed-cc1101.bin) | Full factory image (bootloader + partitions + app), for a **clean single-boot** install | `0x0` |
+
+On the GitHub page, open the file and use **Download raw file**, or clone the
+repository and take the images from the root.
 
 If you already run a dual-boot launcher, use **only** the `-app.bin` image. The
 factory image rewrites the partition table and will break a custom dual-boot
